@@ -169,16 +169,47 @@ setTimeout(function () {
   const monthlyTotal = () => state.bills.reduce((s, b) => s + monthlyEq(b), 0);
   const weeklyRaw = () => monthlyTotal() * 12 / 52;
   const weekly = () => { const r = Number(state.settings.roundTo) || 0; const w = weeklyRaw(); return r > 0 ? Math.ceil(w / r) * r : w; };
-  const balance = () => state.ledger.reduce((s, e) => s + (e.type === "in" ? 1 : -1) * Number(e.amount || 0), 0);
+  const ledgerNet = () => state.ledger.reduce((s, e) => s + (e.type === "in" ? 1 : -1) * Number(e.amount || 0), 0);
+
+  // ---------- daily automatic mode ----------
+  // The bank moves a fixed amount every day and autopay bills pull straight from the bills account
+  // from fundFrom onward. Nothing is logged by hand: deposits and autopay payments are worked out from the dates.
+  const isAuto = () => state.settings.mode === "daily";
+  const dailyNeeded = () => monthlyTotal() * 12 / 365;
+  const occ = (b, k) => addMonths(b.nextDue, k * FREQ[b.freq].months);
+  const autoBill = b => isAuto() && !!b.autopay;
+  function effDue(b) {
+    if (!autoBill(b)) return b.nextDue;
+    const t = iso(today()); let k = 0;
+    while (occ(b, k) < t && k < 600) k++;
+    return occ(b, k);
+  }
+  function autoDays() {
+    if (!isAuto() || !state.settings.startDate) return 0;
+    return Math.max(0, daysBetween(parse(state.settings.startDate), today()) + 1);
+  }
+  const autoDeposits = () => autoDays() * Number(state.settings.dailyAmount || 0);
+  function autoPaid() {
+    if (!isAuto()) return 0;
+    const t = iso(today()), from = state.settings.fundFrom || "9999-12-31"; let s = 0;
+    for (const b of state.bills) {
+      if (!b.autopay) continue;
+      for (let k = 0; k < 600; k++) { const d = occ(b, k); if (d > t) break; if (d >= from) s += Number(b.amount); }
+    }
+    return s;
+  }
+  const balance = () => ledgerNet() + autoDeposits() - autoPaid();
+  const fromChecking = (b, due) => autoBill(b) && due < (state.settings.fundFrom || "9999-12-31");
 
   function allocate() {
     const t = today();
     let left = Math.max(0, balance());
-    return [...state.bills].sort((a, b) => a.nextDue.localeCompare(b.nextDue)).map(b => {
+    return state.bills.map(b => ({ b, d: effDue(b) })).sort((x, y) => x.d.localeCompare(y.d)).map(({ b, d: dueStr }) => {
       const amt = Number(b.amount || 0);
+      if (fromChecking(b, dueStr)) return { bill: b, due: dueStr, alloc: 0, pct: 0, status: ["track", "From checking"], daysLeft: daysBetween(t, parse(dueStr)) };
       const alloc = Math.min(amt, left); left -= alloc;
-      const due = parse(b.nextDue);
-      const start = parse(addMonths(b.nextDue, -FREQ[b.freq || "monthly"].months));
+      const due = parse(dueStr);
+      const start = parse(addMonths(dueStr, -FREQ[b.freq || "monthly"].months));
       const frac = Math.min(1, Math.max(0, (t - start) / (due - start)));
       const expected = amt * frac;
       let status;
@@ -186,7 +217,7 @@ setTimeout(function () {
       else if (alloc >= amt - 0.005) status = ["ready", "Ready"];
       else if (alloc >= expected - 1) status = ["track", "On track"];
       else status = ["behind", "Behind"];
-      return { bill: b, alloc, pct: amt ? alloc / amt : 0, status, daysLeft: daysBetween(t, due) };
+      return { bill: b, due: dueStr, alloc, pct: amt ? alloc / amt : 0, status, daysLeft: daysBetween(t, due) };
     });
   }
 
@@ -217,7 +248,75 @@ setTimeout(function () {
   }
 
   // ---------- views ----------
+  function firstOfMonthAfter(days) { const d = addDays(today(), days); return iso(new Date(d.getFullYear(), d.getMonth() + 1, 1)); }
+
+  function setupDailyCard() {
+    const amt = el("input", { id: "auto-amt", type: "number", inputmode: "decimal", step: "0.01", min: "0", value: String(Math.ceil(dailyNeeded())), "aria-label": "Daily transfer amount" });
+    const start = el("input", { id: "auto-start", type: "date", value: iso(today()) });
+    const from = el("input", { id: "auto-from", type: "date", value: firstOfMonthAfter(30) });
+    return el("section", { class: "card" },
+      el("h2", { text: "Daily automatic mode" }),
+      el("div", { text: `Your bank moves a small amount every day (you need ${money(dailyNeeded())} a day), and your autopay bills pull straight from the bills account. The app keeps track by itself.` }),
+      el("div", { class: "grid2" },
+        el("label", { class: "f", for: "auto-amt" }, "Daily transfer ($)", amt),
+        el("label", { class: "f", for: "auto-start" }, "First daily transfer", start)),
+      el("label", { class: "f", for: "auto-from" }, "Autopay bills pull from the bills account starting", from),
+      el("div", { class: "note", text: "Until that date your autopays keep paying from checking, so you never need a big starting transfer." }),
+      el("div", { class: "actions" }, el("button", { class: "primary", onclick: () => {
+        if (!(Number(amt.value) > 0) || !start.value || !from.value) { toast("Fill in the amount and both dates."); return; }
+        saveSettings({ mode: "daily", dailyAmount: Math.round(Number(amt.value) * 100) / 100, startDate: start.value, fundFrom: from.value });
+      } }, "Turn on daily mode")));
+  }
+
+  function viewTodayAuto() {
+    const t = today(), tIso = iso(t), bal = balance(), rows = allocate(), out = [];
+    const daily = Number(state.settings.dailyAmount || 0), from = state.settings.fundFrom;
+    out.push(el("section", { class: "card hero" },
+      el("div", { class: "label", text: "In your bill fund (estimated)" }),
+      el("div", { class: "big num", text: money(bal) }),
+      el("div", { class: "row" },
+        el("div", {}, el("span", { class: "label", text: "Daily transfer" }), el("span", { class: "num", text: money(daily) })),
+        el("div", {}, el("span", { class: "label", text: "Needed per day" }), el("span", { class: "num", text: money(dailyNeeded()) })),
+        el("div", {}, el("span", { class: "label", text: "Bills per month" }), el("span", { class: "num", text: money(monthlyTotal()) })))));
+
+    const started = tIso >= state.settings.startDate;
+    const lines = [
+      el("div", { class: "line" }, el("span", { text: started ? `Daily transfers counted` : "Daily transfers start" }), el("span", { class: "num", text: started ? `${autoDays()} days · ${money(autoDeposits())}` : nice(state.settings.startDate) })),
+      el("div", { class: "line" }, el("span", { text: "Autopay pulls from the bills account" }), el("span", { class: "num", text: tIso >= from ? `since ${nice(from)}` : `from ${nice(from)}` }))
+    ];
+    if (autoPaid() > 0) lines.push(el("div", { class: "line" }, el("span", { text: "Autopay bills paid from the fund" }), el("span", { class: "num", text: money(autoPaid()) })));
+    if (daily + 0.005 < dailyNeeded()) lines.push(el("div", { class: "note", text: `Your daily transfer is below the ${money(dailyNeeded())} your bills need. Raise it in your bank and in Settings.` }));
+    out.push(el("section", { class: "card" }, el("h2", { text: "Automatic" }), el("div", { class: "stack" }, lines),
+      el("div", { class: "note", text: "This balance is worked out from your schedule. Check it against your bills account now and then. If they differ, add the difference on the Log tab." })));
+
+    const daysToSwitch = daysBetween(t, parse(from));
+    if (daysToSwitch > 0 && daysToSwitch <= 21) {
+      const firstBills = rows.filter(r => r.bill.autopay && r.due >= from).slice(0, 4).map(r => r.bill.name).join(", ");
+      out.push(el("section", { class: "card" }, el("h2", { text: "Switch your autopays" }),
+        el("div", { text: `In ${daysToSwitch} days your bills start coming out of the bills account. Before ${nice(from)}, change each autopay to pull from the bills account instead of checking.` }),
+        firstBills ? el("div", { class: "note", text: "First ones up: " + firstBills + "." }) : null));
+    }
+
+    const horizon = iso(addDays(t, 7));
+    const manual = rows.filter(r => !r.bill.autopay && r.due <= horizon);
+    if (manual.length) {
+      const total = manual.reduce((s, r) => s + Number(r.bill.amount), 0);
+      out.push(el("section", { class: "card" },
+        el("div", { class: "line" }, el("h2", { text: "Pay these yourself" }), el("span", { class: "muted small", text: "Due in the next 7 days" })),
+        el("div", { class: "stack" }, manual.map(r => el("div", { class: "line" },
+          el("div", {}, el("div", { class: "name", text: r.bill.name }), el("div", { class: "muted small", text: nice(r.due) })),
+          el("span", { class: "num", text: money(Number(r.bill.amount)) })))),
+        el("div", { class: "note", text: "These don't have autopay. Pay them from the bills account, then tap below." }),
+        el("div", { class: "actions" }, el("button", { class: "primary", onclick: () => moveBack(manual.map(r => r.bill), total) }, `I paid ${money(total)}`))));
+    }
+
+    const upcoming = rows.filter(r => r.due > horizon || r.bill.autopay).slice(0, 8);
+    if (upcoming.length) out.push(el("section", { class: "card" }, el("h2", { text: "Coming up" }), el("div", {}, upcoming.map(billRow))));
+    return out;
+  }
+
   function viewToday() {
+    if (isAuto()) return viewTodayAuto();
     const t = today(), pay = nextPayday(), bal = balance(), wk = weekly();
     const rows = allocate();
     const out = [];
@@ -231,6 +330,8 @@ setTimeout(function () {
         el("div", {}, el("span", { class: "label", text: "Per day" }), el("span", { class: "num", text: money(monthlyTotal() * 12 / 365) }))
       )
     ));
+
+    if (state.bills.length) out.push(setupDailyCard());
 
     if (!state.ledger.length && state.bills.length) {
       const near = rows.filter(r => r.daysLeft <= 31).reduce((s, r) => s + Number(r.bill.amount), 0);
@@ -282,11 +383,11 @@ setTimeout(function () {
     const open = () => editBill(b);
     return el("div", { class: "bill", tabindex: "0", role: "button", "aria-label": `Edit ${b.name}`, onclick: open, onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } } },
       el("div", { class: "line" },
-        el("div", {}, el("div", { class: "name", text: b.name }), el("div", { class: "muted small", text: `${FREQ[b.freq].label} · next ${nice(b.nextDue)}${b.variable ? " · estimate" : ""}` })),
+        el("div", {}, el("div", { class: "name", text: b.name }), el("div", { class: "muted small", text: `${FREQ[b.freq].label} · next ${nice(r.due)}${b.variable ? " · estimate" : ""}` })),
         el("div", { style: "text-align:right" }, el("div", { class: "num", text: money(Number(b.amount)) }), el("span", { class: "chip " + r.status[0], text: r.status[1] }))
       ),
       el("div", { class: "bar", "aria-hidden": "true" }, el("i", { style: `width:${Math.round(r.pct * 100)}%` })),
-      el("div", { class: "muted small num", text: `${money(r.alloc)} of ${money(Number(b.amount))} set aside` })
+      el("div", { class: "muted small num", text: r.status[1] === "From checking" ? "Paid from checking until autopay moves to the bills account" : `${money(r.alloc)} of ${money(Number(b.amount))} set aside` })
     );
   }
 
@@ -306,8 +407,22 @@ setTimeout(function () {
 
     const paySel = el("select", { id: "set-payday" }, WEEKDAYS.map((d, i) => el("option", { value: String(i), selected: i === Number(state.settings.payday) }, d)));
     const roundSel = el("select", { id: "set-round" }, [["0", "Exact amount"], ["1", "Nearest $1"], ["5", "Nearest $5"], ["10", "Nearest $10"]].map(([v, l]) => el("option", { value: v, selected: Number(v) === Number(state.settings.roundTo) }, l)));
+    if (isAuto()) {
+      const amt = el("input", { id: "set-daily", type: "number", inputmode: "decimal", step: "0.01", min: "0", value: String(state.settings.dailyAmount) });
+      const start = el("input", { id: "set-start", type: "date", value: state.settings.startDate });
+      const from = el("input", { id: "set-from", type: "date", value: state.settings.fundFrom });
+      out.push(el("section", { class: "card" },
+        el("h2", { text: "Daily automatic mode" }),
+        el("div", { class: "grid2" },
+          el("label", { class: "f", for: "set-daily" }, "Daily transfer ($)", amt),
+          el("label", { class: "f", for: "set-start" }, "First daily transfer", start)),
+        el("label", { class: "f", for: "set-from" }, "Autopay pulls from the bills account starting", from),
+        el("div", { class: "actions" },
+          el("button", { onclick: () => { if (!(Number(amt.value) > 0) || !start.value || !from.value) { toast("Fill in the amount and both dates."); return; } saveSettings({ dailyAmount: Math.round(Number(amt.value) * 100) / 100, startDate: start.value, fundFrom: from.value }); } }, "Save"),
+          el("button", { class: "ghost", onclick: () => saveSettings({ mode: "payday" }) }, "Go back to payday mode"))));
+    }
     out.push(el("section", { class: "card" },
-      el("h2", { text: "Settings" }),
+      el("h2", { text: isAuto() ? "Payday mode settings" : "Settings" }),
       el("div", { class: "grid2" },
         el("label", { class: "f", for: "set-payday" }, "Payday", paySel),
         el("label", { class: "f", for: "set-round" }, "Round set-aside up to", roundSel)),
@@ -329,7 +444,13 @@ setTimeout(function () {
       el("section", { class: "card" },
         el("div", { class: "line" }, el("span", { text: "Moved in" }), el("span", { class: "num in", text: money(totalIn) })),
         el("div", { class: "line" }, el("span", { text: "Moved back for bills" }), el("span", { class: "num", text: money(totalOut) })),
-        el("div", { class: "line" }, el("strong", { text: "In the fund" }), el("strong", { class: "num", text: money(totalIn - totalOut) }))),
+        isAuto() ? el("div", { class: "line" }, el("span", { text: `Daily transfers (${autoDays()} days)` }), el("span", { class: "num in", text: money(autoDeposits()) })) : null,
+        isAuto() ? el("div", { class: "line" }, el("span", { text: "Autopay bills paid from the fund" }), el("span", { class: "num", text: money(autoPaid()) })) : null,
+        el("div", { class: "line" }, el("strong", { text: "In the fund" }), el("strong", { class: "num", text: money(balance()) }))),
+      isAuto() ? (() => { const a = el("input", { id: "adj-amt", type: "number", inputmode: "decimal", step: "0.01", "aria-label": "Adjustment amount" });
+        return el("section", { class: "card" }, el("h2", { text: "Fix the balance" }),
+          el("div", { class: "note", text: "If the app's balance doesn't match your bills account, enter the difference (use a minus sign if the app is too high)." }),
+          el("div", { class: "amount-in" }, a, el("button", { onclick: () => { const v = Number(a.value); if (!v) return; v > 0 ? logIn(v, "Balance fix") : logOut(-v, "Balance fix"); } }, "Add"))); })() : null,
       el("section", { class: "card" },
         el("h2", { text: "Every move" }),
         list.length
@@ -356,6 +477,9 @@ setTimeout(function () {
   async function logIn(amount, note) {
     if (!(amount > 0)) { toast("Enter an amount above $0."); return; }
     await guard(() => state.db.collection("ledger").add({ type: "in", amount: Math.round(amount * 100) / 100, date: iso(today()), at: new Date().toISOString(), note }), `Added ${money(amount)} to the fund`);
+  }
+  async function logOut(amount, note) {
+    await guard(() => state.db.collection("ledger").add({ type: "out", amount: Math.round(amount * 100) / 100, date: iso(today()), at: new Date().toISOString(), note }), `Took ${money(amount)} off the balance`);
   }
   async function moveBack(bills, total) {
     await guard(async () => {
@@ -462,7 +586,9 @@ setTimeout(function () {
     }
     const main = d.settings && d.settings.main ? d.settings.main : {};
     store.bills = bills; store.ledger = ledger;
-    store.settings = { main: { payday: Number.isInteger(main.payday) && main.payday >= 0 && main.payday < 7 ? main.payday : 3, roundTo: [0, 1, 5, 10].includes(Number(main.roundTo)) ? Number(main.roundTo) : 5 } };
+    const okDate = v => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+    store.settings = { main: { payday: Number.isInteger(main.payday) && main.payday >= 0 && main.payday < 7 ? main.payday : 3, roundTo: [0, 1, 5, 10].includes(Number(main.roundTo)) ? Number(main.roundTo) : 5,
+      ...(main.mode === "daily" && Number(main.dailyAmount) > 0 && okDate(main.startDate) && okDate(main.fundFrom) ? { mode: "daily", dailyAmount: Number(main.dailyAmount), startDate: main.startDate, fundFrom: main.fundFrom } : {}) } };
     try { persist(); toast(`Loaded ${Object.keys(bills).length} bills`); } catch (e) { toast("Couldn't save on this phone. Check you aren't in a private browser tab."); }
   }
   function pickFile() {
